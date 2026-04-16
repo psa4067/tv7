@@ -20,20 +20,18 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     window_size=(1366, 768),
     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-def run_full_season_github_action(driver: Driver, data=None):
+def run_series_scraper(driver: Driver, data=None):
     base_domain = "https://tv3.nontondrama.my"
     
-    # --- CONFIG GITHUB ACTION ---
+    # --- CONFIG FILTER ---
     TARGET_YEARS = [2014, 2013]
-    START_PAGE = 1 # Set ke 1 untuk auto-run rutin, atau sesuaikan jika ingin catch-up data lama
+    START_PAGE = 1 
     # ---------------------------
 
-    print(f"[*] GITHUB ACTION START - YEARS: {TARGET_YEARS}")
+    print(f"[*] SCRAPER START - YEARS: {TARGET_YEARS}")
 
     for target_year in TARGET_YEARS:
         year_url = f"{base_domain}/year/{target_year}"
-        print(f"\n[!] SCANNING TAHUN: {target_year}")
-        
         driver.google_get(year_url)
         time.sleep(10)
         
@@ -48,9 +46,8 @@ def run_full_season_github_action(driver: Driver, data=None):
             p_url = f"{year_url}/page/{page}" if page > 1 else year_url
             print(f"\n--- HALAMAN {page}/{total_pages} ---")
             
-            if page > START_PAGE:
-                driver.get(p_url)
-                time.sleep(7)
+            driver.get(p_url)
+            time.sleep(7)
             
             page_soup = soupify(driver)
             articles = page_soup.select('article')
@@ -68,15 +65,31 @@ def run_full_season_github_action(driver: Driver, data=None):
                     driver.get(full_s_link)
                     time.sleep(6)
                     
-                    series_soup = soupify(driver)
-                    seasons = [opt.get('value') for opt in series_soup.select('select.season-select option') if opt.get('value')]
+                    # Ambil daftar season yang tersedia
+                    initial_soup = soupify(driver)
+                    seasons = [opt.get('value') for opt in initial_soup.select('select.season-select option') if opt.get('value')]
                     
-                    if not seasons: continue
+                    if not seasons:
+                        # Jika tidak ada dropdown, mungkin hanya ada 1 season (S1)
+                        seasons = ['1']
 
                     for sea_num in seasons:
-                        ep_elements = series_soup.select('ul.episode-list li a')
-                        temp_ep_list = []
+                        print(f"    [-] Processing Season {sea_num}...")
                         
+                        # --- FIX: LOGIKA PINDAH SEASON ---
+                        # Kita coba klik/pilih season di dropdown
+                        try:
+                            if len(seasons) > 1:
+                                driver.select('select.season-select', sea_num)
+                                time.sleep(5) # Tunggu AJAX update daftar episode
+                        except:
+                            print(f"        [!] Gagal pindah season via UI, mencoba stay di halaman saat ini.")
+
+                        # Ambil ulang soup setelah pindah season
+                        current_series_soup = soupify(driver)
+                        ep_elements = current_series_soup.select('ul.episode-list li a')
+                        
+                        temp_ep_list = []
                         for ep_el in ep_elements:
                             ep_href = ep_el.get('href')
                             clean_ep_num = re.sub(r'\D', '', ep_el.text.strip())
@@ -90,9 +103,11 @@ def run_full_season_github_action(driver: Driver, data=None):
                                 "sea_num": int(sea_num)
                             })
 
-                        if not temp_ep_list: continue
+                        if not temp_ep_list:
+                            print(f"        [!] No episodes found for S{sea_num}")
+                            continue
 
-                        # BATCH CHECK KE SUPABASE (Hemat API Call & Waktu)
+                        # --- BATCH CHECK KE SUPABASE ---
                         ids_to_check = [item['id'] for item in temp_ep_list]
                         check_db = supabase.table("series_episodes").select("id_episode").in_("id_episode", ids_to_check).execute()
                         existing_ids = {item['id_episode'] for item in check_db.data}
@@ -101,7 +116,7 @@ def run_full_season_github_action(driver: Driver, data=None):
                             if ep_data['id'] in existing_ids:
                                 continue 
 
-                            print(f"        [+] NEW EPISODE: {ep_data['id']}")
+                            print(f"        [+] NEW EP: {ep_data['id']}")
                             driver.get(ep_data['url'])
                             time.sleep(8)
                             
@@ -109,9 +124,14 @@ def run_full_season_github_action(driver: Driver, data=None):
                             options = video_soup.select('select#player-select option')
                             
                             links = {}
+                            # Menambah server cadangan agar tidak banyak yang skip
+                            allowed_servers = ['cast', 'turbovip', 'pro', 'direct']
+                            
                             for opt in options:
-                                val, serv = opt.get('value', '').strip(), opt.get('data-server', '').lower()
-                                if val and serv in ['cast', 'turbovip']:
+                                val = opt.get('value', '').strip()
+                                serv = opt.get('data-server', '').lower()
+                                
+                                if val and serv in allowed_servers:
                                     links[serv] = 'https:' + val if val.startswith('//') else val
                             
                             if links:
@@ -124,12 +144,19 @@ def run_full_season_github_action(driver: Driver, data=None):
                                     "link_turbo": links.get('turbovip')
                                 }
                                 supabase.table("series_episodes").upsert(payload).execute()
-                                print(f"            [OK] Saved to Supabase.")
+                                print(f"            [OK] Saved.")
+                            else:
+                                print(f"            [SKIP] No premium servers found.")
+
+                        # Setelah selesai satu season, balik ke halaman series 
+                        # untuk reset state dropdown jika perlu
+                        driver.get(full_s_link)
+                        time.sleep(3)
 
                 except Exception as e:
                     print(f"    [ERR] {series_slug}: {e}")
         
-        START_PAGE = 1 # Reset untuk tahun berikutnya
+        START_PAGE = 1
 
 if __name__ == "__main__":
-    run_full_season_github_action()
+    run_series_scraper()
