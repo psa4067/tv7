@@ -65,16 +65,10 @@ def run_series_supabase_scraper(driver: Driver, data=None):
                     if not s_link: continue
                     if not s_link.startswith('http'): s_link = base_domain + s_link
                     
-                    series_slug_full = s_link.strip('/').split('/')[-1]
-                    
-                    # Memisahkan Judul dan Tahun (Contoh: stranger-things-2016)
-                    match_slug = re.match(r"(.+)-(\d{4})$", series_slug_full)
-                    if match_slug:
-                        base_title = match_slug.group(1)
-                        series_year = match_slug.group(2)
-                    else:
-                        base_title = series_slug_full
-                        series_year = str(target_year)
+                    # Ambil slug dasar dari URL
+                    series_slug_raw = s_link.strip('/').split('/')[-1]
+                    # Bersihkan tahun lama jika ada di slug URL (misal: judul-2016 -> judul)
+                    base_title = re.sub(r'-\d{4}$', '', series_slug_raw)
 
                     try:
                         print(f"\n[*] Menganalisa Series: {base_title}")
@@ -82,47 +76,52 @@ def run_series_supabase_scraper(driver: Driver, data=None):
                         time.sleep(4)
                         series_soup = soupify(driver)
                         
-                        # Dapatkan semua Season yang tersedia
                         seasons = [opt.get('value') for opt in series_soup.select('select.season-select option') if opt.get('value')]
                         
                         for sea_num in seasons:
-                            print(f"    [>] Memproses Season {sea_num}...")
-                            
-                            # STRATEGI: Buka Episode 1 untuk setiap season guna memicu list episode yang benar
-                            # Format: /judul-season-X-episode-1-tahun
-                            entry_url = f"{base_domain}/{base_title}-season-{sea_num}-episode-1-{series_year}"
-                            
+                            # 1. Buka Episode 1 untuk mendapatkan Tahun yang Akurat dari movie-info
+                            entry_url = f"{base_domain}/{base_title}-season-{sea_num}-episode-1-{target_year}"
                             driver.get(entry_url)
                             time.sleep(5)
                             
-                            # Jika 404 pada format standar (terutama Season 1), coba format alternatif
                             if "404" in driver.title or "Not Found" in driver.title:
-                                entry_url = f"{base_domain}/{base_title}-episode-1-{series_year}"
+                                entry_url = f"{base_domain}/{base_title}-episode-1-{target_year}"
                                 driver.get(entry_url)
                                 time.sleep(5)
 
-                            # Sekarang kita berada di watchpage season tersebut. 
-                            # Ambil list episode dari 'ul.episode-list.fade-in' sesuai screenshot Anda
                             watch_soup = soupify(driver)
-                            episode_links = watch_soup.select('ul.episode-list li a')
                             
+                            # --- EKSTRAKSI TAHUN DARI H1 (movie-info) ---
+                            # Format: "Nonton Bloodhounds - Season 1 Episode 1 (2023) Streaming"
+                            h1_el = watch_soup.select_one('div.movie-info h1')
+                            extracted_year = str(target_year) # Fallback ke tahun folder jika gagal
+                            
+                            if h1_el:
+                                year_match = re.search(r'\((\d{4})\)', h1_el.text)
+                                if year_match:
+                                    extracted_year = year_match.group(1)
+                            
+                            # Format series_title: judul-tahun
+                            series_title_db = f"{base_title}-{extracted_year}"
+                            
+                            episode_links = watch_soup.select('ul.episode-list li a')
                             if not episode_links:
-                                print(f"    [!] Tidak ditemukan list episode di {entry_url}")
                                 continue
 
-                            print(f"    [+] Ditemukan {len(episode_links)} episode untuk Season {sea_num}")
+                            print(f"    [>] Season {sea_num} ({extracted_year}): {len(episode_links)} Episode ditemukan.")
 
                             for ep_tag in episode_links:
                                 ep_href = ep_tag.get('href')
                                 ep_text = ep_tag.text.strip()
-                                # Ambil angka episode saja
                                 clean_ep_num = re.sub(r'\D', '', ep_text)
                                 if not clean_ep_num: continue
 
+                                # Format id_episode: judul-tahun-sX-eX
+                                unique_id = f"{series_title_db}-s{sea_num}-e{clean_ep_num}"
+                                
                                 ep_final_url = ep_href if ep_href.startswith('http') else base_domain + ep_href
-                                unique_id = f"{base_title}-s{sea_num}-e{clean_ep_num}"
 
-                                # Cek Database
+                                # Cek DB
                                 check_db = supabase.table("series_episodes").select("id_episode").eq("id_episode", unique_id).execute()
                                 if check_db.data:
                                     print(f"        [-] Skip {unique_id} (Exist)")
@@ -146,21 +145,19 @@ def run_series_supabase_scraper(driver: Driver, data=None):
                                 if links_only:
                                     payload = {
                                         "id_episode": unique_id,
-                                        "series_title": base_title,
+                                        "series_title": series_title_db, # Format: judul-tahun
                                         "season": int(sea_num),
                                         "episode": int(clean_ep_num),
                                         "link_cast": links_only.get('cast'),
                                         "link_turbo": links_only.get('turbovip')
                                     }
                                     supabase.table("series_episodes").upsert(payload).execute()
-                                    print(f"            [OK] Saved.")
-                                else:
-                                    print(f"            [!] Link video tidak ditemukan.")
+                                    print(f"            [OK] Saved to DB.")
 
                     except Exception as e:
                         print(f"    [ERROR] Gagal pada {base_title}: {e}")
 
-        print("\n[DONE] Siklus selesai. Istirahat 15 menit...")
+        print("\n[DONE] Siklus selesai. Menunggu restart...")
         time.sleep(900)
 
 if __name__ == "__main__":
