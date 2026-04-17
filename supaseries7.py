@@ -18,11 +18,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- KONFIGURASI RENTANG SCRAPING ---
-# Silakan ubah variabel di bawah ini sesuai kebutuhan
+# --- KONFIGURASI RENTANG ---
 TAHUN_MULAI = 2014
-TAHUN_SELESAI = 2013  # Berhenti di tahun ini (inklusif)
-HALAMAN_MULAI = 1     # Mulai dari halaman ini (hanya untuk TAHUN_MULAI)
+TAHUN_SELESAI = 2013
+HALAMAN_MULAI = 1
 
 @browser(
     headless=True,
@@ -33,19 +32,13 @@ HALAMAN_MULAI = 1     # Mulai dari halaman ini (hanya untuk TAHUN_MULAI)
 def run_series_supabase_scraper(driver: Driver, data=None):
     base_domain = "https://tv3.nontondrama.my"
     
-    # Loop Abadi jika ingin terus berulang, atau hapus 'while True' jika hanya ingin sekali jalan
     while True: 
         print(f"\n{'='*80}")
-        print(f"[*] SIKLUS SERIES DIMULAI: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"[*] RANGE: {TAHUN_MULAI} ke {TAHUN_SELESAI} | START PAGE: {HALAMAN_MULAI}")
+        print(f"[*] SIKLUS DIMULAI: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}")
 
-        # Loop dari Tahun Mulai turun ke Tahun Selesai
         for target_year in range(TAHUN_MULAI, TAHUN_SELESAI - 1, -1):
             year_url = f"{base_domain}/year/{target_year}"
-            print(f"\n[!] TARGET TAHUN: {target_year}")
-            
-            # 1. Kunjungi halaman pertama tahun tersebut untuk mendapatkan TOTAL HALAMAN
             driver.google_get(year_url)
             time.sleep(5)
             
@@ -54,82 +47,90 @@ def run_series_supabase_scraper(driver: Driver, data=None):
             h3_el = soup.select_one('div.container h3')
             if h3_el and "dari" in h3_el.text:
                 match = re.search(r'dari\s+(\d+)', h3_el.text)
-                if match: 
-                    total_pages = int(match.group(1))
+                if match: total_pages = int(match.group(1))
 
-            # Tentukan dari halaman mana kita mulai
-            # Jika tahun saat ini adalah TAHUN_MULAI, gunakan HALAMAN_MULAI. 
-            # Jika sudah ganti tahun, mulai dari 1.
             current_start_page = HALAMAN_MULAI if target_year == TAHUN_MULAI else 1
             
-            if current_start_page > total_pages:
-                print(f"[!] Start Page {current_start_page} melampaui total halaman ({total_pages}). Skip tahun ini.")
-                continue
-
             for page in range(current_start_page, total_pages + 1):
                 p_url = f"{year_url}/page/{page}" if page > 1 else year_url
-                print(f"\n--- HALAMAN {page}/{total_pages} --- URL: {p_url}")
+                print(f"\n--- HALAMAN {page}/{total_pages} (TAHUN {target_year}) ---")
                 
                 driver.get(p_url)
                 time.sleep(5)
-                
                 page_soup = soupify(driver)
-                raw_links = [a.get('href') for a in page_soup.select('article figure a') if a.get('href')]
+                articles = page_soup.select('article figure a')
                 
-                if not raw_links:
-                    print(f"[?] Tidak ada series ditemukan di halaman {page}")
-                    continue
-
-                for link in raw_links:
-                    s_link = link if link.startswith('http') else base_domain + (link if link.startswith('/') else '/' + link)
-                    series_slug = s_link.strip('/').split('/')[-1]
+                for a_tag in articles:
+                    s_link = a_tag.get('href')
+                    if not s_link: continue
+                    if not s_link.startswith('http'): s_link = base_domain + s_link
                     
+                    series_slug_full = s_link.strip('/').split('/')[-1]
+                    
+                    # Memisahkan Judul dan Tahun (Contoh: stranger-things-2016)
+                    match_slug = re.match(r"(.+)-(\d{4})$", series_slug_full)
+                    if match_slug:
+                        base_title = match_slug.group(1)
+                        series_year = match_slug.group(2)
+                    else:
+                        base_title = series_slug_full
+                        series_year = str(target_year)
+
                     try:
-                        print(f"[*] Checking Series: {series_slug}")
+                        print(f"\n[*] Menganalisa Series: {base_title}")
                         driver.get(s_link)
-                        time.sleep(5)
-                        
+                        time.sleep(4)
                         series_soup = soupify(driver)
+                        
+                        # Dapatkan semua Season yang tersedia
                         seasons = [opt.get('value') for opt in series_soup.select('select.season-select option') if opt.get('value')]
                         
-                        if not seasons:
-                            continue
-
                         for sea_num in seasons:
-                            ep_elements = series_soup.select('ul.episode-list li a')
-                            temp_ep_list = []
+                            print(f"    [>] Memproses Season {sea_num}...")
                             
-                            for ep_el in ep_elements:
-                                ep_href = ep_el.get('href')
-                                ep_num_text = ep_el.text.strip()
-                                clean_ep_num = re.sub(r'\D', '', ep_num_text)
+                            # STRATEGI: Buka Episode 1 untuk setiap season guna memicu list episode yang benar
+                            # Format: /judul-season-X-episode-1-tahun
+                            entry_url = f"{base_domain}/{base_title}-season-{sea_num}-episode-1-{series_year}"
+                            
+                            driver.get(entry_url)
+                            time.sleep(5)
+                            
+                            # Jika 404 pada format standar (terutama Season 1), coba format alternatif
+                            if "404" in driver.title or "Not Found" in driver.title:
+                                entry_url = f"{base_domain}/{base_title}-episode-1-{series_year}"
+                                driver.get(entry_url)
+                                time.sleep(5)
+
+                            # Sekarang kita berada di watchpage season tersebut. 
+                            # Ambil list episode dari 'ul.episode-list.fade-in' sesuai screenshot Anda
+                            watch_soup = soupify(driver)
+                            episode_links = watch_soup.select('ul.episode-list li a')
+                            
+                            if not episode_links:
+                                print(f"    [!] Tidak ditemukan list episode di {entry_url}")
+                                continue
+
+                            print(f"    [+] Ditemukan {len(episode_links)} episode untuk Season {sea_num}")
+
+                            for ep_tag in episode_links:
+                                ep_href = ep_tag.get('href')
+                                ep_text = ep_tag.text.strip()
+                                # Ambil angka episode saja
+                                clean_ep_num = re.sub(r'\D', '', ep_text)
                                 if not clean_ep_num: continue
-                                
-                                unique_id = f"{series_slug}-s{sea_num}-e{clean_ep_num}"
-                                full_ep_url = ep_href if ep_href.startswith('http') else base_domain + (ep_href if ep_href.startswith('/') else '/' + ep_href)
-                                
-                                temp_ep_list.append({
-                                    "id": unique_id,
-                                    "url": full_ep_url,
-                                    "ep_num": int(clean_ep_num),
-                                    "sea_num": int(sea_num)
-                                })
 
-                            if not temp_ep_list: continue
+                                ep_final_url = ep_href if ep_href.startswith('http') else base_domain + ep_href
+                                unique_id = f"{base_title}-s{sea_num}-e{clean_ep_num}"
 
-                            # --- BATCH CHECK (SUPABASE) ---
-                            ids_to_check = [item['id'] for item in temp_ep_list]
-                            check_db = supabase.table("series_episodes").select("id_episode").in_("id_episode", ids_to_check).execute()
-                            existing_ids = {item['id_episode'] for item in check_db.data}
-
-                            for ep_data in temp_ep_list:
-                                if ep_data['id'] in existing_ids:
-                                    print(f"    [-] Skip (Exist): {ep_data['id']}")
+                                # Cek Database
+                                check_db = supabase.table("series_episodes").select("id_episode").eq("id_episode", unique_id).execute()
+                                if check_db.data:
+                                    print(f"        [-] Skip {unique_id} (Exist)")
                                     continue
 
-                                print(f"    [*] Scraping New Episode: {ep_data['id']}")
-                                driver.get(ep_data['url'])
-                                time.sleep(8)
+                                print(f"        [*] Scraping: {unique_id}")
+                                driver.get(ep_final_url)
+                                time.sleep(7)
                                 
                                 video_soup = soupify(driver)
                                 options = video_soup.select('select#player-select option')
@@ -144,22 +145,22 @@ def run_series_supabase_scraper(driver: Driver, data=None):
                                 
                                 if links_only:
                                     payload = {
-                                        "id_episode": ep_data['id'],
-                                        "series_title": series_slug,
-                                        "season": ep_data['sea_num'],
-                                        "episode": ep_data['ep_num'],
+                                        "id_episode": unique_id,
+                                        "series_title": base_title,
+                                        "season": int(sea_num),
+                                        "episode": int(clean_ep_num),
                                         "link_cast": links_only.get('cast'),
                                         "link_turbo": links_only.get('turbovip')
                                     }
                                     supabase.table("series_episodes").upsert(payload).execute()
-                                    print(f"        [OK] Saved to DB.")
+                                    print(f"            [OK] Saved.")
                                 else:
-                                    print(f"        [!] No links found.")
+                                    print(f"            [!] Link video tidak ditemukan.")
 
                     except Exception as e:
-                        print(f"    [ERROR] Gagal pada {series_slug}: {e}")
+                        print(f"    [ERROR] Gagal pada {base_title}: {e}")
 
-        print("\n[DONE] Semua range tahun selesai. Menunggu 15 menit sebelum restart...")
+        print("\n[DONE] Siklus selesai. Istirahat 15 menit...")
         time.sleep(900)
 
 if __name__ == "__main__":
